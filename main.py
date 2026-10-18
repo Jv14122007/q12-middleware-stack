@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 app = FastAPI(title="Middleware Stack API")
 
 # Assignment configuration
-USER_EMAIL = "-25f2006465@ds.study.iitm.ac.in"
+USER_EMAIL = "25f2006465@ds.study.iitm.ac.in"
 
 ALLOWED_ORIGINS = [
     "https://app-ymvogy.example.com",
