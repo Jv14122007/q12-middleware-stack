@@ -1,126 +1,134 @@
 
+import asyncio
+import math
+import os
 import time
 import uuid
 from collections import defaultdict, deque
-from threading import Lock
-from contextvars import ContextVar
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.datastructures import MutableHeaders
 
-EMAIL = "25f2006465@ds.study.iitm.ac.in"
+app = FastAPI(title="Middleware Stack API")
+
+# Assignment configuration
+USER_EMAIL = "-25f2006465@ds.study.iitm.ac.in"
+
 ALLOWED_ORIGINS = [
     "https://app-ymvogy.example.com",
-    # Add the actual exam page origin here if it differs.
+    "https://exam.sanand.workers.dev",
 ]
 
 RATE_LIMIT = 12
 WINDOW_SECONDS = 10
 
-request_id_context = ContextVar("request_id", default=None)
-client_requests = defaultdict(deque)
-lock = Lock()
-
-api = FastAPI()
+# Per-client rolling-window rate-limit buckets
+rate_limit_store = defaultdict(deque)
+rate_limit_lock = asyncio.Lock()
 
 
-@api.middleware("http")
+# Middleware 1: Request context
+@app.middleware("http")
 async def request_context_middleware(request: Request, call_next):
-    supplied_id = request.headers.get("X-Request-ID")
-    request_id = supplied_id if supplied_id else str(uuid.uuid4())
+    request_id = request.headers.get("X-Request-ID")
 
-    token = request_id_context.set(request_id)
+    if not request_id:
+        request_id = str(uuid.uuid4())
+
     request.state.request_id = request_id
 
-    try:
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        return response
-    finally:
-        request_id_context.reset(token)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+
+    return response
 
 
-@api.middleware("http")
+# Middleware 2: Per-client rate limiting
+@app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    # OPTIONS preflight requests do not consume quota.
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    client_id = request.headers.get("X-Client-Id")
-    if client_id:
-        now = time.monotonic()
+    client_id = request.headers.get("X-Client-Id", "default").strip()
+    if not client_id:
+        client_id = "default"
 
-        with lock:
-            timestamps = client_requests[client_id]
+    now = time.monotonic()
 
-            while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
-                timestamps.popleft()
+    async with rate_limit_lock:
+        timestamps = rate_limit_store[client_id]
 
-            if len(timestamps) >= RATE_LIMIT:
-                retry_after = max(
-                    1,
-                    int(WINDOW_SECONDS - (now - timestamps[0]) + 0.999),
-                )
-                return JSONResponse(
-                    status_code=429,
-                    content={"detail": "Rate limit exceeded"},
-                    headers={"Retry-After": str(retry_after)},
-                )
+        while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
+            timestamps.popleft()
 
-            timestamps.append(now)
+        if len(timestamps) >= RATE_LIMIT:
+            retry_after = max(
+                1,
+                math.ceil(WINDOW_SECONDS - (now - timestamps[0])),
+            )
+
+            response = JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": str(retry_after)},
+            )
+
+            # Preserve request context on rate-limit responses too.
+            request_id = getattr(
+                request.state, "request_id", None
+            )
+            if request_id:
+                response.headers["X-Request-ID"] = request_id
+
+            return response
+
+        timestamps.append(now)
 
     return await call_next(request)
 
 
-@api.get("/ping")
+# Endpoint required by the grader
+@app.get("/ping")
 async def ping(request: Request):
     return {
-        "email": EMAIL,
+        "email": USER_EMAIL,
         "request_id": request.state.request_id,
     }
 
 
-# CORS wraps the application so headers are applied even to 429 responses.
-cors_app = CORSMiddleware(
-    app=api,
+@app.get("/")
+async def root():
+    return {"message": "Middleware Stack API is running"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# Middleware 3: CORS wraps the complete application so that
+# CORS headers are also present on HTTP 429 responses.
+app = CORSMiddleware(
+    app=app,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Content-Type",
+        "X-Client-Id",
+        "X-Request-ID",
+    ],
     expose_headers=["X-Request-ID", "Retry-After"],
-    max_age=600,
 )
 
 
-class EnsureRequestIdHeader:
-    """Ensure the response always includes the request ID."""
+if __name__ == "__main__":
+    import uvicorn
 
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        request_headers = dict(scope.get("headers", []))
-        supplied = request_headers.get(b"x-request-id")
-        request_id = (
-            supplied.decode("latin-1")
-            if supplied
-            else str(uuid.uuid4())
-        )
-
-        scope.setdefault("state", {})["request_id"] = request_id
-
-        async def send_with_request_id(message):
-            if message["type"] == "http.response.start":
-                headers = MutableHeaders(scope=message)
-                headers["X-Request-ID"] = request_id
-            await send(message)
-
-        await self.app(scope, receive, send_with_request_id)
-
-
-app = EnsureRequestIdHeader(cors_app)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8000")),
+    )
